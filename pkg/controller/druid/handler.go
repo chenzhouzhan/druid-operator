@@ -29,6 +29,7 @@ const (
 	coordinator         = "coordinator"
 	overlord            = "overlord"
 	middleManager       = "middleManager"
+	indexer             = "indexer"
 	historical          = "historical"
 	router              = "router"
 )
@@ -122,7 +123,7 @@ func deployDruidCluster(sdk client.Client, m *v1alpha1.Druid) error {
 
 		nodeSpec.Ports = append(nodeSpec.Ports, v1.ContainerPort{ContainerPort: nodeSpec.DruidPort, Name: "druid-port"})
 
-		// Create StatefulSet
+		// Create/Update StatefulSet
 		if err := sdkCreateOrUpdateAsNeeded(sdk,
 			func() (object, error) {
 				return makeStatefulSet(&nodeSpec, m, lm, nodeSpecUniqueStr, fmt.Sprintf("%s-%s", commonConfigSHA, nodeConfigSHA), firstServiceName)
@@ -130,6 +131,14 @@ func deployDruidCluster(sdk client.Client, m *v1alpha1.Druid) error {
 			func() object { return makeStatefulSetEmptyObj() },
 			nil, m, statefulSetNames); err != nil {
 			return err
+		}
+
+		// Check StatefulSet rolling update status, if in-progress then stop here Or Create/Update StatefulSet
+		if m.Spec.RollingDeploy {
+			done, err := isStsFullyDeployed(sdk, nodeSpecUniqueStr, m)
+			if !done {
+				return err
+			}
 		}
 
 		// Create PodDisruptionBudget
@@ -311,6 +320,25 @@ func sdkCreateOrUpdateAsNeeded(sdk client.Client, objFn func() (object, error), 
 	}
 
 	return nil
+}
+
+// Checks if all replicas corresponding to latest updated sts have been deployed
+func isStsFullyDeployed(sdk client.Client, name string, drd *v1alpha1.Druid) (bool, error) {
+	sts := makeStatefulSetEmptyObj()
+	if err := sdk.Get(context.TODO(), *namespacedName(name, drd.Namespace), sts); err != nil {
+		e := fmt.Errorf("Failed to get [StatefuleSet:%s] due to [%s].", name, err.Error())
+		logger.Error(e, e.Error(), "name", drd.Name, "namespace", drd.Namespace)
+		sendEvent(sdk, drd, v1.EventTypeWarning, "GET_FAIL", e.Error())
+		return false, e
+	} else {
+		if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
+			msg := fmt.Sprintf("StatefulSet[%s] roll out is in progress CurrentRevision[%s] != UpdateRevision[%s], UpdatedReplicas[%d/%d]", name, sts.Status.CurrentRevision, sts.Status.UpdateRevision, sts.Status.UpdatedReplicas, sts.Spec.Replicas)
+			sendEvent(sdk, drd, v1.EventTypeNormal, "ROLLING_DEPLOYMENT_WAIT", msg)
+			return false, nil
+		} else {
+			return true, nil
+		}
+	}
 }
 
 func stringifyForLogging(obj object, drd *v1alpha1.Druid) string {
@@ -523,6 +551,17 @@ func makeStatefulSet(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map
 	// enables to do the trick to force redeployment in case of configmap changes.
 	envHolder = append(envHolder, v1.EnvVar{Name: "configMapSHA", Value: configMapSHA})
 
+	updateStrategy := firstNonNilValue(m.Spec.UpdateStrategy, &appsv1.StatefulSetUpdateStrategy{}).(*appsv1.StatefulSetUpdateStrategy)
+	updateStrategy = firstNonNilValue(nodeSpec.UpdateStrategy, updateStrategy).(*appsv1.StatefulSetUpdateStrategy)
+
+	livenessProbe := updateDefaultPortInProbe(
+		firstNonNilValue(nodeSpec.LivenessProbe, m.Spec.LivenessProbe).(*v1.Probe),
+		nodeSpec.DruidPort)
+
+	readinessProbe := updateDefaultPortInProbe(
+		firstNonNilValue(nodeSpec.ReadinessProbe, m.Spec.ReadinessProbe).(*v1.Probe),
+		nodeSpec.DruidPort)
+
 	// Create StatefulSet
 	result := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
@@ -539,26 +578,29 @@ func makeStatefulSet(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName:         serviceName,
 			Replicas:            &nodeSpec.Replicas,
-			PodManagementPolicy: appsv1.ParallelPodManagement,
+			PodManagementPolicy: appsv1.PodManagementPolicyType(firstNonEmptyStr(firstNonEmptyStr(string(nodeSpec.PodManagementPolicy), string(m.Spec.PodManagementPolicy)), string(appsv1.ParallelPodManagement))),
+			UpdateStrategy:      *updateStrategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: ls,
 			},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      ls,
-					Annotations: m.Spec.PodAnnotations,
+					Annotations: firstNonNilValue(nodeSpec.PodAnnotations, m.Spec.PodAnnotations).(map[string]string),
 				},
 				Spec: v1.PodSpec{
 					NodeSelector: m.Spec.NodeSelector,
 					Containers: []v1.Container{
 						{
-							Image:        firstNonEmptyStr(nodeSpec.Image, m.Spec.Image),
-							Name:         fmt.Sprintf("%s", nodeSpecUniqueStr),
-							Command:      []string{firstNonEmptyStr(m.Spec.StartScript, "bin/run-druid.sh"), nodeSpec.NodeType},
-							Ports:        nodeSpec.Ports,
-							Resources:    nodeSpec.Resources,
-							Env:          envHolder,
-							VolumeMounts: volumeMountHolder,
+							Image:          firstNonEmptyStr(nodeSpec.Image, m.Spec.Image),
+							Name:           fmt.Sprintf("%s", nodeSpecUniqueStr),
+							Command:        []string{firstNonEmptyStr(m.Spec.StartScript, "bin/run-druid.sh"), nodeSpec.NodeType},
+							Ports:          nodeSpec.Ports,
+							Resources:      nodeSpec.Resources,
+							Env:            envHolder,
+							VolumeMounts:   volumeMountHolder,
+							LivenessProbe:  livenessProbe,
+							ReadinessProbe: readinessProbe,
 						},
 					},
 					Volumes:         volumesHolder,
@@ -570,6 +612,13 @@ func makeStatefulSet(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map
 	}
 
 	return result, nil
+}
+
+func updateDefaultPortInProbe(probe *v1.Probe, defaultPort int32) *v1.Probe {
+	if probe != nil && probe.HTTPGet != nil && probe.HTTPGet.Port.IntVal == 0 && probe.HTTPGet.Port.StrVal == "" {
+		probe.HTTPGet.Port.IntVal = defaultPort
+	}
+	return probe
 }
 
 func makePodDisruptionBudget(nodeSpec *v1alpha1.DruidNodeSpec, m *v1alpha1.Druid, ls map[string]string, nodeSpecUniqueStr string) (*v1beta1.PodDisruptionBudget, error) {
@@ -783,6 +832,7 @@ func getAllNodeSpecsInDruidPrescribedOrder(m *v1alpha1.Druid) ([]keyAndNodeSpec,
 		historical:    make([]keyAndNodeSpec, 0, 1),
 		overlord:      make([]keyAndNodeSpec, 0, 1),
 		middleManager: make([]keyAndNodeSpec, 0, 1),
+		indexer:       make([]keyAndNodeSpec, 0, 1),
 		router:        make([]keyAndNodeSpec, 0, 1),
 	}
 
@@ -800,6 +850,7 @@ func getAllNodeSpecsInDruidPrescribedOrder(m *v1alpha1.Druid) ([]keyAndNodeSpec,
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[historical]...)
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[overlord]...)
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[middleManager]...)
+	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[indexer]...)
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[broker]...)
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[coordinator]...)
 	allNodeSpecs = append(allNodeSpecs, nodeSpecsByNodeType[router]...)
